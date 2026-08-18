@@ -2,50 +2,191 @@ name: Reverse Engineer SO Libraries
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '*.so'
+      - '**/*.so'
+      - 'scripts/**'
+      - '.github/workflows/reverse-engineer.yml'
+
+concurrency:
+  group: reverse-engineer-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   analyze-so:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     permissions:
       contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install analysis tools
+        shell: bash
         run: |
-          sudo apt update
-          sudo apt install -y unzip zip binutils file python3
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241015.zip -O ghidra.zip
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binutils file jq python3 unzip zip curl
+
+          GHIDRA_URL="$(curl -fsSL \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.assets[] | select(.name | test("ghidra_.*_PUBLIC_.*\\.zip$")) | .browser_download_url' \
+            | head -n 1)"
+
+          if [ -z "$GHIDRA_URL" ] || [ "$GHIDRA_URL" = "null" ]; then
+            echo "Could not resolve latest Ghidra release ZIP"
+            exit 1
+          fi
+
+          echo "Downloading Ghidra from $GHIDRA_URL"
+          curl -fL "$GHIDRA_URL" -o ghidra.zip
           unzip -q ghidra.zip
+          GHIDRA_HOME="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -mindepth 1 -type d -name 'ghidra_*_PUBLIC' | head -n 1)"
 
-      - name: Extract metadata and strings
+          if [ -z "$GHIDRA_HOME" ] || [ ! -x "$GHIDRA_HOME/support/analyzeHeadless" ]; then
+            echo "Ghidra installation was not found"
+            exit 1
+          fi
+
+          echo "GHIDRA_HOME=$GHIDRA_HOME" >> "$GITHUB_ENV"
+          "$GHIDRA_HOME/support/analyzeHeadless" 2>&1 | head -n 30 || true
+
+      - name: Discover shared libraries
+        shell: bash
         run: |
-          mkdir -p output/{strings,elf,decompile}
-          for f in *.so; do
-            [ -f "$f" ] || continue
-            base=$(basename "$f" .so)
-            strings "$f" > "output/strings/${base}.txt"
-            file "$f" > "output/elf/${base}.file.txt"
-            readelf -a "$f" > "output/elf/${base}.elf.txt" || true
-            nm -D "$f" > "output/elf/${base}.symbols.txt" || true
-          done
+          set -euo pipefail
+          find "$GITHUB_WORKSPACE" -type f -name '*.so' -not -path '*/.git/*' -print0 > "$RUNNER_TEMP/so-files.bin"
+          COUNT="$(tr -cd '\0' < "$RUNNER_TEMP/so-files.bin" | wc -c)"
+          echo "Found $COUNT shared libraries"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No .so files found"
+            exit 1
+          fi
 
-      - name: Ghidra headless decompile
+      - name: Extract strings, ELF metadata, symbols and disassembly
+        shell: bash
         run: |
-          mkdir -p ghidra_project
-          /ghidra_11.2.1_PUBLIC/support/analyzeHeadless ghidra_project OpenCoCAnalysis \
-            -import *.so \
-            -scriptPath scripts \
-            -postScript ExportCpp.java \
-            -overwrite || true
+          set -euo pipefail
+          mkdir -p output/strings output/elf output/symbols output/disassembly output/hashes output/logs
 
-      - name: Clean generated output
+          while IFS= read -r -d '' f; do
+            rel="${f#${GITHUB_WORKSPACE}/}"
+            key="$(printf '%s' "$rel" | sed 's#[/ ]#_#g; s#\.so$##')"
+            echo "Static extraction: $rel"
+
+            file "$f" > "output/elf/${key}.file.txt" || true
+            sha256sum "$f" > "output/hashes/${key}.sha256.txt" || true
+            sha1sum "$f" > "output/hashes/${key}.sha1.txt" || true
+            md5sum "$f" > "output/hashes/${key}.md5.txt" || true
+
+            strings -a -n 4 "$f" > "output/strings/${key}.ascii.txt" || true
+            strings -a -el -n 4 "$f" > "output/strings/${key}.utf16le.txt" || true
+
+            readelf -h "$f" > "output/elf/${key}.header.txt" || true
+            readelf -S "$f" > "output/elf/${key}.sections.txt" || true
+            readelf -l "$f" > "output/elf/${key}.segments.txt" || true
+            readelf -d "$f" > "output/elf/${key}.dynamic.txt" || true
+            readelf -r "$f" > "output/elf/${key}.relocations.txt" || true
+            readelf -n "$f" > "output/elf/${key}.notes.txt" || true
+            readelf -V "$f" > "output/elf/${key}.versions.txt" || true
+            readelf -Ws "$f" > "output/symbols/${key}.readelf-symbols.txt" || true
+            nm -D -C "$f" > "output/symbols/${key}.dynamic-symbols.txt" || true
+            objdump -T -C "$f" > "output/symbols/${key}.dynamic-table.txt" || true
+            objdump -d -C "$f" > "output/disassembly/${key}.asm.txt" || true
+            objdump -s -j .rodata "$f" > "output/disassembly/${key}.rodata.txt" || true
+          done < "$RUNNER_TEMP/so-files.bin"
+
+      - name: Ghidra headless analysis and decompilation
+        shell: bash
         run: |
-          python3 scripts/clean_decompiler.py output/decompile || true
-          zip -r OpenCoC-reverse-engineering.zip output
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ghidra-projects" output/decompile/raw output/logs
 
-      - name: Upload result
+          FAILURES=0
+          INDEX=0
+          while IFS= read -r -d '' f; do
+            INDEX=$((INDEX + 1))
+            rel="${f#${GITHUB_WORKSPACE}/}"
+            key="$(printf '%s' "$rel" | sed 's#[^A-Za-z0-9._-]#_#g; s#\.so$##')"
+            project="OpenCoC_${INDEX}_${key}"
+            log="output/logs/${key}.ghidra.log"
+
+            echo "Ghidra analyzing: $rel"
+            if ! "$GHIDRA_HOME/support/analyzeHeadless" \
+              "$RUNNER_TEMP/ghidra-projects" "$project" \
+              -import "$f" \
+              -overwrite \
+              -analysisTimeoutPerFile 10800 \
+              -scriptPath "$GITHUB_WORKSPACE/scripts" \
+              -postScript ExportCpp.java "$GITHUB_WORKSPACE/output/decompile/raw" \
+              -deleteProject \
+              2>&1 | tee "$log"; then
+              echo "Ghidra failed for $rel" | tee -a "$log"
+              FAILURES=$((FAILURES + 1))
+            fi
+          done < "$RUNNER_TEMP/so-files.bin"
+
+          echo "ghidra_failures=$FAILURES" >> "$GITHUB_ENV"
+
+      - name: Clean reconstructed C and C++ output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/clean_decompiler.py output/decompile/raw output/decompile/clean
+
+          mkdir -p packages
+          find output -type f -print0 | sort -z | xargs -0 sha256sum > output/MANIFEST.sha256
+
+          (cd output/decompile/raw && zip -qr ../../../packages/OpenCoC-decompiled-raw.zip .)
+          (cd output/decompile/clean && zip -qr ../../../packages/OpenCoC-decompiled-clean.zip .)
+          (cd output/strings && zip -qr ../../packages/OpenCoC-strings.zip .)
+          (cd output/symbols && zip -qr ../../packages/OpenCoC-symbols.zip .)
+          (cd output/elf && zip -qr ../../packages/OpenCoC-elf-metadata.zip .)
+          (cd output/disassembly && zip -qr ../../packages/OpenCoC-disassembly.zip .)
+          zip -qr packages/OpenCoC-reverse-engineering-full.zip output
+
+          ls -lh packages
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OpenCoC-reverse-engineering
-          path: OpenCoC-reverse-engineering.zip
+          name: OpenCoC-reverse-engineering-${{ github.run_number }}
+          path: packages/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="reverse-engineering-${GITHUB_RUN_NUMBER}"
+          TITLE="OpenCoC Reverse Engineering #${GITHUB_RUN_NUMBER}"
+
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Automated reverse-engineering bundle for the .so libraries in this revision."
+            echo
+            echo "Included: Ghidra reconstructed C/C++, raw and cleaned decompiler output, strings, ELF metadata, symbols, disassembly, hashes and logs."
+            echo
+            echo "Ghidra failures reported by the job: ${ghidra_failures:-0}"
+            echo
+            echo "Important: reconstructed C/C++ is best-effort pseudo-source and is not guaranteed to be the original or directly compilable source code."
+          } > "$NOTES_FILE"
+
+          gh release create "$TAG" packages/*.zip \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file "$NOTES_FILE"
