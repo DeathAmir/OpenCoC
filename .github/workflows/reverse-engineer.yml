@@ -1,0 +1,51 @@
+name: Reverse Engineer SO Libraries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze-so:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y unzip zip binutils file python3
+          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241015.zip -O ghidra.zip
+          unzip -q ghidra.zip
+
+      - name: Extract metadata and strings
+        run: |
+          mkdir -p output/{strings,elf,decompile}
+          for f in *.so; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f" .so)
+            strings "$f" > "output/strings/${base}.txt"
+            file "$f" > "output/elf/${base}.file.txt"
+            readelf -a "$f" > "output/elf/${base}.elf.txt" || true
+            nm -D "$f" > "output/elf/${base}.symbols.txt" || true
+          done
+
+      - name: Ghidra headless decompile
+        run: |
+          mkdir -p ghidra_project
+          /ghidra_11.2.1_PUBLIC/support/analyzeHeadless ghidra_project OpenCoCAnalysis \
+            -import *.so \
+            -scriptPath scripts \
+            -postScript ExportCpp.java \
+            -overwrite || true
+
+      - name: Clean generated output
+        run: |
+          python3 scripts/clean_decompiler.py output/decompile || true
+          zip -r OpenCoC-reverse-engineering.zip output
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCoC-reverse-engineering
+          path: OpenCoC-reverse-engineering.zip
