@@ -3,6 +3,8 @@ import re
 import shutil
 import sys
 
+SOURCE_EXTENSIONS = ('.c', '.cpp', '.h', '.hpp')
+
 src = sys.argv[1] if len(sys.argv) > 1 else 'output/decompile/raw'
 dst = sys.argv[2] if len(sys.argv) > 2 else 'output/decompile/clean'
 
@@ -11,9 +13,10 @@ if os.path.abspath(src) != os.path.abspath(dst):
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
-for root, _, files in os.walk(dst):
-    for name in files:
-        if not name.endswith(('.c', '.cpp', '.h', '.hpp')):
+for root, dirs, files in os.walk(dst):
+    dirs.sort()
+    for name in sorted(files):
+        if not name.endswith(SOURCE_EXTENSIONS):
             continue
         path = os.path.join(root, name)
         try:
