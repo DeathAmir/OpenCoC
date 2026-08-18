@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 180
 
     env:
-      GHIDRA_TAG: Ghidra_12.1_build
-      GHIDRA_SHA256: aa5cbcbbf48f41ca185fce900e19592f1ade4cd5994eb6e0ede468dac8a6f302
+      GHIDRA_TAG: Ghidra_12.1.2_build
+      GHIDRA_SHA256: b62e81a0390618466c019c60d8c2f796ced2509c4c1aea4a37644a77272cf99d
 
     steps:
       - name: Checkout
@@ -41,17 +41,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             binutils binutils-multiarch file zip unzip jq clang clang-format
 
-      - name: Download and verify Ghidra 12.1
+      - name: Download and verify Ghidra 12.1.2
         shell: bash
         run: |
           set -Eeuo pipefail
           api="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/${GHIDRA_TAG}"
-          asset_url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name | startswith("ghidra_12.1_PUBLIC_") and endswith(".zip")) | .browser_download_url' | head -n1)"
+          asset_url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name | startswith("ghidra_12.1.2_PUBLIC_") and endswith(".zip")) | .browser_download_url' | head -n1)"
           test -n "$asset_url" && test "$asset_url" != "null"
           curl -fL --retry 4 --retry-delay 3 "$asset_url" -o "$RUNNER_TEMP/ghidra.zip"
           echo "${GHIDRA_SHA256}  $RUNNER_TEMP/ghidra.zip" | sha256sum -c -
           unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP"
-          ghidra_home="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'ghidra_12.1_PUBLIC*' | head -n1)"
+          ghidra_home="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'ghidra_12.1.2_PUBLIC*' | head -n1)"
           test -x "$ghidra_home/support/analyzeHeadless"
           echo "GHIDRA_HOME=$ghidra_home" >> "$GITHUB_ENV"
 
