@@ -1,0 +1,100 @@
+name: Reverse engineer shared objects
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.so'
+      - 'tools/reverse/**'
+      - '.github/workflows/reverse-so.yml'
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  reverse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      GHIDRA_TAG: Ghidra_12.1_build
+      GHIDRA_SHA256: aa5cbcbbf48f41ca185fce900e19592f1ade4cd5994eb6e0ede468dac8a6f302
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils binutils-multiarch file zip unzip jq clang clang-format
+
+      - name: Download and verify Ghidra 12.1
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          api="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/${GHIDRA_TAG}"
+          asset_url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name | startswith("ghidra_12.1_PUBLIC_") and endswith(".zip")) | .browser_download_url' | head -n1)"
+          test -n "$asset_url" && test "$asset_url" != "null"
+          curl -fL --retry 4 --retry-delay 3 "$asset_url" -o "$RUNNER_TEMP/ghidra.zip"
+          echo "${GHIDRA_SHA256}  $RUNNER_TEMP/ghidra.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP"
+          ghidra_home="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'ghidra_12.1_PUBLIC*' | head -n1)"
+          test -x "$ghidra_home/support/analyzeHeadless"
+          echo "GHIDRA_HOME=$ghidra_home" >> "$GITHUB_ENV"
+
+      - name: Reverse engineer all .so files
+        shell: bash
+        run: |
+          chmod +x tools/reverse/run_reverse.sh tools/reverse/postprocess.py
+          tools/reverse/run_reverse.sh "$GHIDRA_HOME" "$PWD/reverse-output"
+
+      - name: Package results
+        shell: bash
+        run: |
+          zip -9 -qr OpenCoC-reverse.zip reverse-output
+          sha256sum OpenCoC-reverse.zip | tee OpenCoC-reverse.zip.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCoC-reverse-${{ github.sha }}
+          path: |
+            OpenCoC-reverse.zip
+            OpenCoC-reverse.zip.sha256
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create GitHub release
+        if: success() && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="reverse-${GITHUB_RUN_NUMBER}"
+          fi
+          cp OpenCoC-reverse.zip "OpenCoC-${tag}.zip"
+          cp OpenCoC-reverse.zip.sha256 "OpenCoC-${tag}.zip.sha256"
+          gh release create "$tag" \
+            "OpenCoC-${tag}.zip" \
+            "OpenCoC-${tag}.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "OpenCoC reverse engineering ${GITHUB_SHA::7}" \
+            --generate-notes
